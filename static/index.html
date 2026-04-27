@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elite Kym AI</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+</head>
+<body>
+    <div id="loading-overlay">
+        <div class="loader-logo">🤖</div>
+        <div style="color: var(--accent); font-weight: 500;">Iniciando sistema Kym...</div>
+        <div style="font-size: 0.8rem; color: #64748b; margin-top: 0.5rem;">Cargando modelos y memoria</div>
+    </div>
+
+    <div id="sidebar">
+        <div class="sidebar-header">
+            <button class="new-chat-btn" onclick="startNewChat()">+ Nueva Conversación</button>
+        </div>
+        <div class="session-list" id="session-list"></div>
+    </div>
+
+    <div id="main">
+        <header>
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <button class="toggle-side" onclick="document.getElementById('sidebar').classList.toggle('collapsed')">☰</button>
+                <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: #9ca3af; border-left: 1px solid #374151; padding-left: 1rem;">
+                    <span>Efímero</span>
+                    <label class="switch">
+                        <input type="checkbox" id="ephemeral-toggle">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+            <div id="status-container">
+                <span id="status-icon"></span>
+                <span id="status-text">Listo</span>
+            </div>
+        </header>
+
+        <div id="chat-window">
+            <button id="load-more-btn" onclick="loadMore()">Cargar mensajes anteriores</button>
+        </div>
+
+        <div id="file-preview" style="display:none; padding: 0.5rem 2rem; background: var(--card); border-top: 1px solid #374151; font-size: 0.8rem; color: var(--accent);">
+            📎 Archivo seleccionado: <span id="file-name"></span> 
+            <button onclick="clearFile()" style="background:none; border:none; color:red; cursor:pointer; margin-left:10px;">✕</button>
+        </div>
+
+        <div class="model-selector-container">
+            <span>Cerebro:</span>
+            <select id="model-select"></select>
+            <input type="file" id="file-input" style="display:none" onchange="handleFileSelect(this)">
+            <button onclick="document.getElementById('file-input').click()" style="background:none; border:1px solid #374151; color:#9ca3af; border-radius:4px; padding:2px 8px; cursor:pointer; font-size:0.8rem;">📎 Subir</button>
+        </div>
+
+        <div class="controls">
+            <textarea id="input" rows="1" placeholder="Escribe un mensaje o arrastra un archivo..." oninput="autoResize(this)"></textarea>
+            <button class="btn btn-stop" id="stop-btn" onclick="stop()">Parar</button>
+            <button class="btn btn-primary" id="send-btn" onclick="send()">Enviar</button>
+        </div>
+    </div>
+
+    <script>
+        // Configuración global de Markdown
+        marked.setOptions({
+            breaks: true,
+            gfm: true,
+            headerIds: false,
+            mangle: false
+        });
+
+        let currentSessionId = null;
+        let currentOffset = 0;
+        let selectedFile = null;
+        const urlToken = new URLSearchParams(window.location.search).get('token');
+
+        const chatWindow = document.getElementById('chat-window');
+        const sessionList = document.getElementById('session-list');
+        const input = document.getElementById('input');
+        const modelSelect = document.getElementById('model-select');
+        const loadMoreBtn = document.getElementById('load-more-btn');
+
+        function autoResize(el) {
+            el.style.height = 'auto';
+            el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+        }
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                send();
+            }
+        });
+
+        async function init() {
+            try {
+                await loadModels();
+                await refreshSessions();
+                if (sessionList.firstChild) loadSession(sessionList.firstChild.dataset.id);
+                else startNewChat();
+            } finally {
+                // Ocultar overlay con un pequeño retraso para suavidad
+                setTimeout(() => {
+                    document.getElementById('loading-overlay').classList.add('hidden');
+                }, 800);
+            }
+        }
+
+        async function loadModels() {
+            const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+            const res = await fetch(`/models${tokenSuffix}`);
+            const models = await res.json();
+            modelSelect.innerHTML = models.map(m => `<option value="${m}" ${m.includes('llama3.1')?'selected':''}>${m}</option>`).join('');
+        }
+
+        async function refreshSessions() {
+            const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+            const res = await fetch(`/sessions${tokenSuffix}`);
+            const sessions = await res.json();
+            sessionList.innerHTML = sessions.map(s => `
+                <div class="session-item ${s.id === currentSessionId ? 'active' : ''}" data-id="${s.id}" style="display:flex; align-items:center;">
+                    <span style="flex:1; overflow:hidden; text-overflow:ellipsis;" onclick="loadSession('${s.id}')">${s.title}</span>
+                    <button onclick="event.stopPropagation(); renamePrompt('${s.id}', '${s.title}')" style="background:none; border:none; color:#9ca3af; cursor:pointer;">✎</button>
+                </div>
+            `).join('');
+        }
+
+        async function renamePrompt(id, old) {
+            const n = prompt("Nuevo título:", old);
+            if(n) {
+                const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+                const fd = new FormData(); fd.append('id', id); fd.append('title', n);
+                await fetch(`/sessions/update${tokenSuffix}`, { method: 'POST', body: fd });
+                refreshSessions();
+            }
+        }
+
+        function handleFileSelect(el) {
+            if(el.files.length > 0) {
+                selectedFile = el.files[0];
+                document.getElementById('file-preview').style.display = 'block';
+                document.getElementById('file-name').innerText = selectedFile.name;
+            }
+        }
+
+        function clearFile() {
+            selectedFile = null;
+            document.getElementById('file-input').value = '';
+            document.getElementById('file-preview').style.display = 'none';
+        }
+
+        function startNewChat() {
+            const id = Date.now().toString();
+            const isEphemeral = document.getElementById('ephemeral-toggle').checked;
+            const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+            const fd = new FormData();
+            fd.append('id', id); fd.append('title', isEphemeral ? "👻 Efímero" : "Nueva Conversación"); fd.append('is_ephemeral', isEphemeral);
+            
+            fetch(`/sessions/new${tokenSuffix}`, { method: 'POST', body: fd }).then(() => {
+                currentSessionId = id; currentOffset = 0;
+                Array.from(chatWindow.children).forEach(c => c.id !== 'load-more-btn' && c.remove());
+                loadMoreBtn.style.display = 'none';
+                if(isEphemeral) appendMsg('**Modo Efímero.**', 'ai');
+                refreshSessions();
+            });
+        }
+
+        async function loadSession(id) {
+            currentSessionId = id; currentOffset = 0;
+            Array.from(chatWindow.children).forEach(c => c.id !== 'load-more-btn' && c.remove());
+            await loadMore();
+            refreshSessions();
+        }
+
+        async function loadMore() {
+            const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+            const fd = new FormData(); fd.append('id', currentSessionId); fd.append('offset', currentOffset);
+            const res = await fetch(`/sessions/load${tokenSuffix}`, { method: 'POST', body: fd });
+            const data = await res.json();
+            if(data.history.length > 0) {
+                const oldH = chatWindow.scrollHeight;
+                data.history.reverse().forEach(m => chatWindow.insertBefore(createMsgElement(m.content, m.role==='user'?'user':'ai'), loadMoreBtn.nextSibling));
+                currentOffset += data.history.length;
+                chatWindow.scrollTop = currentOffset <= 10 ? chatWindow.scrollHeight : chatWindow.scrollHeight - oldH;
+            }
+            loadMoreBtn.style.display = data.has_more ? 'block' : 'none';
+        }
+
+        function updateStatus(type, text) {
+            const i = document.getElementById('status-icon');
+            const t = document.getElementById('status-text');
+            t.innerText = text;
+            const map = { thinking:['🧠','pulse'], network:['🌐','spin'], writing:['✍️','bounce'], saving:['☁️','flash'] };
+            const [icon, anim] = map[type] || ['', ''];
+            i.innerText = icon; i.className = anim;
+
+            // Burbuja en el chat
+            let bubble = document.getElementById('active-status-bubble');
+            if (type && type !== 'writing') {
+                if (!bubble) {
+                    bubble = document.createElement('div');
+                    bubble.id = 'active-status-bubble';
+                    bubble.className = 'status-bubble';
+                    chatWindow.appendChild(bubble);
+                }
+                bubble.innerHTML = `<span class="icon ${anim}">${icon}</span> <span>${text}</span>`;
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+            } else if (bubble) {
+                bubble.remove();
+            }
+        }
+
+        async function send() {
+            const val = input.value.trim();
+            if(!val && !selectedFile) return;
+            
+            const isEphemeral = document.getElementById('ephemeral-toggle').checked;
+            const tokenSuffix = urlToken ? `?token=${urlToken}` : '';
+
+            // 1. Mostrar feedback inmediato
+            updateStatus('thinking', 'Kym está despertando...');
+            
+            const formData = new FormData();
+            formData.append('message', val || "Analiza este archivo");
+            formData.append('session_id', currentSessionId);
+            formData.append('model', modelSelect.value);
+            if(selectedFile) formData.append('file', selectedFile);
+
+            // 2. Limpiar input y scroll
+            input.value = '';
+            input.style.height = 'auto';
+            appendMsg(val + (selectedFile ? `\n\n📎 *Archivo: ${selectedFile.name}*` : ''), 'user');
+            clearFile();
+
+            // 3. UI States
+            document.getElementById('send-btn').style.display = 'none';
+            document.getElementById('stop-btn').style.display = 'block';
+            
+            const aiDiv = appendMsg('', 'ai');
+            let fullText = "";
+
+            try {
+                console.log("Enviando petición a /chat...");
+                const response = await fetch(`/chat${tokenSuffix}`, { method: 'POST', body: formData });
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Error ${response.status}: ${errorText || 'Servidor no responde'}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                while(true) {
+                    const {done, value} = await reader.read();
+                    if(done) break;
+                    
+                    const chunk = decoder.decode(value, {stream: true});
+                    
+                    // Procesar múltiples líneas de estado si vienen juntas
+                    const lines = chunk.split('\n');
+                    for(let line of lines) {
+                        if(line.startsWith('status:')) {
+                            const p = line.split(':');
+                            updateStatus(p[1], p[2]);
+                        } else if(line.trim() || chunk.length < 10) { 
+                            // Si no es estado, es contenido
+                            fullText += line;
+                            aiDiv.innerHTML = marked.parse(fullText);
+                            hljs.highlightAll();
+                            chatWindow.scrollTop = chatWindow.scrollHeight;
+                        }
+                    }
+                }
+            } catch(e) { 
+                console.error("Error en el chat:", e);
+                aiDiv.innerHTML = `<span style="color:#ef4444">⚠️ Error: ${e.message}. Asegúrate de que Ollama esté corriendo y el modelo '${modelSelect.value}' esté descargado.</span>`; 
+            }
+            finally { 
+                updateStatus('', 'Listo'); 
+                document.getElementById('send-btn').style.display = 'block'; 
+                document.getElementById('stop-btn').style.display = 'none'; 
+                currentOffset += 2;
+                // Si fue el primer mensaje, actualizar título
+                if(chatWindow.children.length <= 4 && !isEphemeral) {
+                   const fd = new FormData(); fd.append('id', currentSessionId); fd.append('title', val.substring(0,25));
+                   fetch(`/sessions/update${tokenSuffix}`, { method:'POST', body:fd }).then(refreshSessions);
+                }
+            }
+        }
+
+        function createMsgElement(text, type) {
+            const d = document.createElement('div'); d.className = `msg ${type}`;
+            d.innerHTML = marked.parse(text); // Ambos ahora soportan Markdown
+            return d;
+        }
+
+        function appendMsg(text, type) {
+            const d = createMsgElement(text, type); chatWindow.appendChild(d);
+            chatWindow.scrollTop = chatWindow.scrollHeight; return d;
+        }
+
+        async function stop() { fetch('/stop', {method:'POST'}); }
+        init();
+    </script>
+</body>
+</html>
