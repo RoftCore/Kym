@@ -1,50 +1,75 @@
-# 🤖 Elite Agent: Asistente Inteligente Multisesión
+# Kym
 
-Elite Agent es un asistente de IA avanzado construido sobre **Ollama** y **FastAPI**. Está diseñado para ser eficiente, consciente de su propia memoria y capaz de navegar por internet para proporcionar respuestas precisas y actualizadas.
+Kym es un asistente web construido con FastAPI. Puede funcionar con IA local via Ollama o con modelos por API, y guarda sesiones y memoria en archivos JSON.
 
-## 🚀 Características Principales
+## Caracteristicas
 
-- **🧠 Memoria Arquitectónica Modular**: Separa hechos esenciales de contextos temáticos (Negocio, Salud, Proyectos, etc.). El agente activa estos contextos solo cuando es necesario.
-- **🌐 Acceso a Internet Real**: Capacidad para buscar en DuckDuckGo y leer el contenido completo de sitios web mediante web scraping.
-- **📂 Gestión de Sesiones**: Panel lateral para manejar múltiples conversaciones independientes. Las sesiones se guardan automáticamente.
-- **👻 Modo Efímero**: Opción para crear chats temporales que no se guardan en el historial permanente.
-- **🔄 Razonamiento Recursivo**: El agente puede realizar múltiples pasos de "pensamiento" (buscar -> leer -> analizar) antes de responder.
-- **🎨 Interfaz Web Moderna**: Diseño oscuro profesional con soporte completo para **Markdown**, resaltado de sintaxis de código y tablas.
-- **⚡ Precarga Automática (Warm-up)**: Carga el modelo en RAM/VRAM al iniciar para que la primera respuesta sea instantánea.
+- Interfaz web con historial de sesiones.
+- Modo efimero para chats que no se guardan.
+- Soporte para archivos e imagenes.
+- Memoria persistente por categorias.
+- Opcion de usar IA local o modelos por API.
 
-## 🛠️ Instalación
+## Instalacion
 
-1. **Requisitos Previos**:
-   - Tener instalado [Ollama](https://ollama.com/).
-   - Descargar el modelo: `ollama pull llama3.1`.
-   - Python 3.10 o superior.
+Requisitos:
 
-2. **Instalar Dependencias**:
-   ```bash
-   pip install fastapi uvicorn ollama duckduckgo-search beautifulsoup4 requests
-   ```
+- Python 3.10 o superior.
+- Ollama solo si vas a usar IA local.
 
-3. **Ejecutar**:
-   ```bash
-   python agent.py
-   ```
-   *El navegador se abrirá automáticamente en `http://localhost:8000`.*
+Instalacion base del servidor:
 
-## 📂 Estructura del Proyecto
+```bash
+pip install -r requirements.txt
+```
 
-- `agent.py`: Servidor backend y lógica del agente.
-- `static/`: Archivos de la interfaz (HTML, CSS, JS).
-- `sessions/`: Almacén de historiales de conversación (JSON).
-- `memory.json`: Base de datos de memoria a largo plazo (Esencial y Categorías).
-- `skills/`: Instrucciones personalizadas para habilidades específicas.
+Instalacion con IA local:
 
-## 📝 Comandos Internos del Agente
+```bash
+pip install -r requirements-local.txt
+```
 
-El agente gestiona estas acciones de forma autónoma, pero puedes influir en ellas:
-- `[SEARCH: consulta]`: El agente decide buscar en la red.
-- `[READ: url]`: El agente decide profundizar en una web.
-- `[SAVE: categoria | dato]`: El agente decide guardar algo en tu memoria core o temática.
-- `[LOAD: categoria]`: El agente recupera información de un grupo específico.
+Instalacion con modelos por API:
 
-## 🛡️ Licencia
-Este proyecto es de uso libre para experimentación y desarrollo personal.
+```bash
+pip install -r requirements-api.txt
+```
+
+## Ejecucion
+
+Modo local:
+
+```bash
+python agent.py
+```
+
+Modo local usando Ollama remoto en Google Colab por ngrok:
+
+1. Ejecuta `START_COLAB.py` dentro de Google Colab con tu token de ngrok.
+2. Copia la URL publica que imprime el script.
+3. En tu maquina local configura:
+
+```powershell
+$env:KYM_OLLAMA_HOST="https://tu-subdominio.ngrok-free.app"
+python agent.py
+```
+
+Modo sin IA local:
+
+```bash
+python agent.py --no-local
+```
+
+## Archivos de dependencias
+
+- `requirements.txt`: dependencias base del servidor.
+- `requirements-local.txt`: base + librerias para Ollama y busqueda web.
+- `requirements-api.txt`: base + libreria para modelos por API.
+
+## Estructura
+
+- `agent.py`: backend principal.
+- `static/`: interfaz web.
+- `sessions/`: historial de conversaciones.
+- `memory.json`: memoria persistente.
+- `START_COLAB.py`: arranque rapido para Google Colab.

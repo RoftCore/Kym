@@ -1,152 +1,223 @@
-import ollama
-import json
-import os
-import re
-import requests
-import uuid
+import argparse
 import logging
-import base64
-import asyncio
-from pathlib import Path
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
-from fastapi.responses import StreamingResponse, FileResponse
+import os
+import secrets
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Response
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from duckduckgo_search import DDGS
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
-from pypdf import PdfReader
-import secrets
+
+from file_utils import extract_file_context
+from provider_registry import ProviderRegistry
+from providers import (
+    LocalAIProvider,
+    NvidiaAPIProvider,
+    extract_saved_facts,
+    normalize_provider_error,
+    strip_agent_commands,
+)
+from storage import AgentState
+
+# Argumentos CLI
+parser = argparse.ArgumentParser(description="Kym AI Assistant")
+parser.add_argument(
+    "--no-local",
+    action="store_true",
+    help="Deshabilitar el soporte de IA local (Ollama)",
+)
+parser.add_argument(
+    "--ollama-host",
+    default=os.getenv("KYM_OLLAMA_HOST", "http://127.0.0.1:11434"),
+    help="URL del servidor Ollama local o remoto",
+)
+args, _ = parser.parse_known_args()
 
 # Configuración
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-save_executor = ThreadPoolExecutor(max_workers=4)
 
 ACCESS_TOKEN = secrets.token_urlsafe(16)
-DEFAULT_MODEL = "llama3.1"
-# Especificamos el host explícitamente para evitar fallos de resolución
-client = ollama.AsyncClient(host="http://127.0.0.1:11434")
+LOCAL_AI_ENABLED = not args.no_local
+LOCAL_MODEL_ID = "llama3.1"
+API_MODEL_ID = "nvidia/nemotron-3-super-120b-a12b"
+DEFAULT_MODEL = LOCAL_MODEL_ID if LOCAL_AI_ENABLED else API_MODEL_ID
+NVIDIA_API_KEY_ENV = "NVIDIA_AI_API_KEY"
+NVIDIA_API_BASE_URL = "https://integrate.api.nvidia.com/v1"
+OLLAMA_HOST = args.ollama_host
 
-class EliteAgent:
-    def __init__(self, model=DEFAULT_MODEL, memory_file="memory.json", sessions_dir="sessions"):
-        self.model = model
-        self.memory_file = Path(memory_file)
-        self.sessions_dir = Path(sessions_dir)
-        self.sessions_dir.mkdir(exist_ok=True)
-        self.memory = self.load_memory()
-        self.stop_requested = False
+local_provider = LocalAIProvider(
+    enabled=LOCAL_AI_ENABLED,
+    host=OLLAMA_HOST,
+    logger=logger,
+)
+api_provider = NvidiaAPIProvider(
+    model_id=API_MODEL_ID,
+    label="Nemotron 3 Super 120B (NVIDIA)",
+    api_key_env=NVIDIA_API_KEY_ENV,
+    base_url=NVIDIA_API_BASE_URL,
+)
+provider_registry = ProviderRegistry(
+    local_provider=local_provider,
+    default_api_provider=api_provider,
+    logger=logger,
+)
 
-    def load_memory(self):
-        if self.memory_file.exists():
-            try:
-                with open(self.memory_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    for k in ["sessions", "essential", "categories"]:
-                        if k not in data: data[k] = [] if k != "categories" else {}
-                    return data
-            except: pass
-        return {"essential": [], "categories": {}, "sessions": []}
 
-    def save_memory(self):
-        def _save():
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
-                json.dump(self.memory, f, indent=4, ensure_ascii=False)
-        save_executor.submit(_save)
+def get_provider_for_model(model_id: str):
+    return provider_registry.get_provider_for_model(model_id)
 
-    def get_session_data(self, session_id):
-        path = self.sessions_dir / f"{session_id}.json"
-        if path.exists():
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except: pass
-        return {"history": [], "active_categories": []}
 
-    def save_session_data(self, session_id, data):
-        def _save():
-            path = self.sessions_dir / f"{session_id}.json"
-            # Limpiamos imágenes base64 antes de guardar para no saturar el disco
-            clean_history = []
-            for m in data.get("history", []):
-                msg = m.copy()
-                if "images" in msg: del msg["images"]
-                clean_history.append(msg)
-            
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump({"history": clean_history, "active_categories": data.get("active_categories", [])}, f, indent=4, ensure_ascii=False)
-        save_executor.submit(_save)
+class LocalProviderPayload(BaseModel):
+    enabled: bool = True
+    host: str = ""
+    autostart: bool = True
 
-    def build_prompt(self, session_data, ext=""):
-        essential = "\n".join([f"- {f}" for f in self.memory["essential"]])
-        cats = ", ".join(self.memory["categories"].keys())
-        active = session_data.get("active_categories", [])
-        active_str = "".join([f"\n[CAT {c.upper()}]: " + ", ".join(self.memory["categories"][c]) for c in active if c in self.memory["categories"]])
-        
-        return (
-            "Eres Kym, un asistente elite de IA. Markdown SIEMPRE.\n"
-            f"CORE: {essential}\nCATS: {cats}\n{active_str}\n"
-            f"--- INFO EXTRA ---\n{ext}\n"
-            "COMANDOS: [SEARCH: consulta], [SAVE: cat | info], [LOAD: cat]"
-        )
+
+class ApiProviderPayload(BaseModel):
+    label: str
+    model_id: str
+    base_url: str
+    api_key: str
+    source_label: str = "API"
+
 
 app = FastAPI()
-agent = EliteAgent()
+agent = AgentState(model=DEFAULT_MODEL, logger=logger)
+
 
 def is_authorized(request: Request):
     if os.getenv("IS_COLAB") == "true":
         return request.query_params.get("token") == ACCESS_TOKEN
     return True
 
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 @app.get("/")
 async def root(request: Request):
     if not is_authorized(request):
         return {"error": f"Usa token: {ACCESS_TOKEN}"}
-    return FileResponse('static/index.html')
+    return FileResponse("static/index.html")
+
 
 @app.get("/favicon.ico")
 async def favicon():
-    return FileResponse('static/favicon.svg', media_type='image/svg+xml')
+    return FileResponse("static/favicon.svg", media_type="image/svg+xml")
+
 
 @app.get("/models")
 async def get_models(request: Request):
-    if not is_authorized(request): return []
-    try:
-        m = await client.list()
-        return [x['name'] for x in m['models']]
-    except: return [DEFAULT_MODEL]
+    if not is_authorized(request):
+        return []
+
+    provider_models = await provider_registry.list_models()
+    from fastapi import Response
+    
+    models_data = [
+        {"id": item.id, "label": item.label, "source": item.source}
+        for item in provider_models
+    ]
+    
+    return Response(
+        content=json.dumps(models_data),
+        media_type="application/json",
+        headers={"X-Current-Model": agent.model}
+    )
+
+
+@app.get("/providers")
+async def get_providers(request: Request):
+    if not is_authorized(request):
+        raise HTTPException(401)
+    return provider_registry.summary()
+
+
+@app.post("/providers/local")
+async def configure_local_provider(request: Request, payload: LocalProviderPayload):
+    if not is_authorized(request):
+        raise HTTPException(401)
+
+    data = provider_registry.configure_local(
+        enabled=payload.enabled,
+        host=payload.host,
+        autostart=payload.autostart,
+    )
+    return {
+        "ok": True,
+        "local": data,
+        "providers": provider_registry.summary(),
+    }
+
+
+@app.post("/providers/api")
+async def add_api_provider(request: Request, payload: ApiProviderPayload):
+    if not is_authorized(request):
+        raise HTTPException(401)
+
+    if not payload.label.strip():
+        raise HTTPException(400, "El nombre de la IA es obligatorio.")
+    if not payload.model_id.strip():
+        raise HTTPException(400, "El model id es obligatorio.")
+    if not payload.base_url.strip():
+        raise HTTPException(400, "La base URL es obligatoria.")
+    if not payload.api_key.strip():
+        raise HTTPException(400, "La API key es obligatoria.")
+
+    provider = provider_registry.add_api_provider(
+        label=payload.label,
+        model_id=payload.model_id,
+        base_url=payload.base_url,
+        api_key=payload.api_key,
+        source_label=payload.source_label,
+    )
+    agent.model = provider["model_id"]
+    return {
+        "ok": True,
+        "model": provider["model_id"],
+        "provider": provider,
+        "providers": provider_registry.summary(),
+    }
+
 
 @app.get("/sessions")
-async def list_sess(request: Request):
-    if not is_authorized(request): return []
+async def list_sessions(request: Request):
+    if not is_authorized(request):
+        return []
     return agent.memory["sessions"]
 
+
 @app.post("/sessions/new")
-async def new_sess(id: str = Form(...), title: str = Form(...), is_ephemeral: bool = Form(False)):
+async def new_session(
+    id: str = Form(...),
+    title: str = Form(...),
+    is_ephemeral: bool = Form(False),
+):
     if not is_ephemeral:
         agent.memory["sessions"].insert(0, {"id": id, "title": title})
         agent.save_memory()
     return {"ok": True}
 
+
 @app.post("/sessions/update")
-async def upd_sess(id: str = Form(...), title: str = Form(...)):
-    for s in agent.memory["sessions"]:
-        if s["id"] == id:
-            s["title"] = title
+async def update_session(id: str = Form(...), title: str = Form(...)):
+    for session in agent.memory["sessions"]:
+        if session["id"] == id:
+            session["title"] = title
             agent.save_memory()
             return {"ok": True}
     return {"err": "404"}
 
+
 @app.post("/sessions/load")
-async def load_sess(id: str = Form(...), offset: int = Form(0)):
+async def load_session(id: str = Form(...), offset: int = Form(0)):
     data = agent.get_session_data(id)
-    h = data.get("history", [])
-    start = max(0, len(h) - offset - 10)
-    return {"history": h[start:(len(h)-offset)], "has_more": start > 0}
+    history = data.get("history", [])
+    start = max(0, len(history) - offset - 10)
+    return {"history": history[start : len(history) - offset], "has_more": start > 0}
+
 
 @app.post("/chat")
 async def chat(
@@ -154,132 +225,85 @@ async def chat(
     message: str = Form(...),
     session_id: str = Form(...),
     model: str = Form(DEFAULT_MODEL),
-    file: UploadFile = File(None)
+    file: UploadFile = File(None),
 ):
-    if not is_authorized(request): raise HTTPException(401)
-    
+    if not is_authorized(request):
+        raise HTTPException(401)
+
     agent.stop_requested = False
     session_data = agent.get_session_data(session_id)
-    file_ctx = ""
-    imgs = []
+    file_ctx, images = await extract_file_context(file)
 
-    if file:
-        raw = await file.read()
-        if file.content_type.startswith("image/"):
-            imgs.append(base64.b64encode(raw).decode('utf-8'))
-            file_ctx = f"[Imagen: {file.filename}]"
-        elif file.filename.endswith(".pdf"):
-            from io import BytesIO
-            pdf = PdfReader(BytesIO(raw))
-            file_ctx = f"--- PDF {file.filename} ---\n" + "\n".join([p.extract_text() for p in pdf.pages])[:4000]
-        else:
-            file_ctx = f"--- ARCHIVO {file.filename} ---\n" + raw.decode('utf-8', errors='ignore')[:4000]
-
-    # Añadir mensaje de usuario con imágenes si las hay
     user_msg = {"role": "user", "content": message}
-    if imgs:
-        user_msg["images"] = imgs
+    if images:
+        user_msg["images"] = images
     session_data["history"].append(user_msg)
 
     async def generate():
-        ctx = file_ctx
+        provider = get_provider_for_model(model)
+        source = provider.source
+        full_answer = ""
+
         try:
-            print(f"--- Chat con {model} ---")
-            yield "status:thinking:Kym está analizando..."
-            
-            # Razonamiento (Incluimos las imágenes en el historial que enviamos)
-            full_messages = [{"role": "system", "content": agent.build_prompt(session_data, ctx)}] + session_data["history"]
-            
-            res = await client.chat(model=model, messages=full_messages)
-            thought = res['message']['content']
-            search = re.search(r"\[SEARCH:\s*(.*?)\]", thought)
-            if search:
-                query = search.group(1)
-                yield f"status:network:Buscando en internet: {query}..."
-                print(f"--- Buscando: {query} ---")
-                # En las versiones nuevas de ddg, el parámetro es 'keywords'
-                s_res = await asyncio.to_thread(DDGS().text, keywords=query, max_results=3)
-                ctx += f"\n[Resultados Web]: {s_res}"
-                # Actualizar el system prompt con los nuevos datos
-                full_messages[0]["content"] = agent.build_prompt(session_data, ctx)
+            logger.info("Chat con %s", model)
+            yield "status:thinking:Kym está analizando...\n"
 
+            if not model:
+                raise RuntimeError(
+                    f"No hay modelos disponibles. Inicia Ollama local, configura KYM_OLLAMA_HOST o define {NVIDIA_API_KEY_ENV}."
+                )
 
-            # Respuesta Final Streaming
-            yield "status:writing:Redactando respuesta..."
-            full_ans = ""
-            async for chunk in await client.chat(model=model, messages=full_messages, stream=True):
-                if agent.stop_requested: break
-                text = chunk['message']['content']
-                full_ans += text
-                yield re.sub(r"\[.*?\]", "", text)
+            build_system_prompt = lambda extra: agent.build_prompt(session_data, extra)
 
-            # Guardar en memoria y persistir
-            clean = re.sub(r"\[.*?\]", "", full_ans).strip()
-            saves = re.findall(r"\[SAVE:\s*(.*?)\s*\|\s*(.*?)\]", full_ans)
-            if saves:
-                yield "status:saving:Memorizando..."
-                for c, f in saves:
-                    c, f = c.strip().lower(), f.strip()
-                    if c == "essential": agent.memory["essential"].append(f)
-                    else:
-                        if c not in agent.memory["categories"]: agent.memory["categories"][c] = []
-                        agent.memory["categories"][c].append(f)
-                agent.save_memory()
+            async for event in provider.stream_chat(
+                model=model,
+                history_messages=session_data["history"],
+                build_system_prompt=build_system_prompt,
+                extra_context=file_ctx,
+                stop_requested=lambda: agent.stop_requested,
+            ):
+                if event.kind == "status":
+                    yield f"status:{event.value}:{event.detail}\n"
+                    continue
+
+                full_answer += event.value
+                yield strip_agent_commands(event.value)
+
+            clean = strip_agent_commands(full_answer).strip()
+            if agent.apply_saves(extract_saved_facts(full_answer)):
+                yield "status:saving:Memorizando...\n"
 
             session_data["history"].append({"role": "assistant", "content": clean})
             agent.save_session_data(session_id, session_data)
-            print("--- Listo ---")
+            logger.info("Respuesta completada")
 
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            yield f"\n⚠️ Error: {str(e)}"
+        except Exception as exc:
+            exc = normalize_provider_error(source, exc, NVIDIA_API_KEY_ENV)
+            logger.exception("Error durante el chat")
+            yield f"\n⚠️ Error: {str(exc)}"
 
     return StreamingResponse(generate(), media_type="text/plain")
 
+
 @app.post("/stop")
-async def stop(): agent.stop_requested = True; return {"ok": True}
+async def stop():
+    agent.stop_requested = True
+    return {"ok": True}
 
-import socket
-import subprocess
-
-def ensure_ollama_running():
-    """Comprueba si Ollama está activo, si no, intenta iniciarlo."""
-    port = 11434
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(('127.0.0.1', port)) != 0:
-            print("⚠️ Ollama no detectado. Intentando iniciar servicio automáticamente...")
-            try:
-                # Iniciar ollama serve en segundo plano
-                subprocess.Popen(["ollama", "serve"], 
-                                 stdout=subprocess.DEVNULL, 
-                                 stderr=subprocess.DEVNULL,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-                
-                # Esperar hasta 10 segundos a que el puerto se abra
-                for _ in range(10):
-                    time.sleep(1)
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
-                        if s2.connect_ex(('127.0.0.1', port)) == 0:
-                            print("✅ Servicio Ollama iniciado con éxito.")
-                            return True
-                print("❌ No se pudo iniciar Ollama automáticamente. Por favor, ábrelo manualmente.")
-            except Exception as e:
-                print(f"❌ Error al intentar ejecutar Ollama: {e}")
-        else:
-            print("🚀 Ollama ya está en ejecución.")
-    return True
 
 if __name__ == "__main__":
     import uvicorn
-    import time
-    
-    # Asegurar que el cerebro esté encendido
-    ensure_ollama_running()
-    
+
+    logger.info("Proveedor local apuntando a %s", local_provider.host)
+    if local_provider.enabled and local_provider.get_client():
+        local_provider.ensure_running()
+
     if os.getenv("IS_COLAB") == "true":
-        print(f"\n🔑 TOKEN: {ACCESS_TOKEN}\n")
+        print(f"\nTOKEN: {ACCESS_TOKEN}\n")
     else:
         from threading import Timer
         import webbrowser
+
         Timer(1.5, lambda: webbrowser.open("http://localhost:8000")).start()
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

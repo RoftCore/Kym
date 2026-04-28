@@ -8,6 +8,7 @@ ENV/
 
 # Datos del Agente (Privado/Usuario)
 memory.json
+providers.json
 sessions/
 skills/*.md
 !skills/coding.md

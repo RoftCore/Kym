@@ -1,0 +1,4 @@
+# Local AI stack. Includes the base app dependencies.
+-r requirements.txt
+ollama
+duckduckgo-search
