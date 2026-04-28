@@ -1,7 +1,7 @@
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import json
 
 
 class AgentState:
@@ -42,7 +42,7 @@ class AgentState:
                 with open(path, "r", encoding="utf-8") as file_handle:
                     return json.load(file_handle)
             except Exception as exc:
-                self.logger.warning("No se pudo cargar la sesión %s: %s", session_id, exc)
+                self.logger.warning("No se pudo cargar la sesion %s: %s", session_id, exc)
         return {"history": [], "active_categories": []}
 
     def save_session_data(self, session_id, data):
@@ -79,27 +79,29 @@ class AgentState:
         )
 
         return (
-            "ERES KYM, UN ASISTENTE ELITE DE IA. REGLAS CRÍTICAS:\n"
-            "1. IDIOMA: Español profesional siempre.\n"
+            "ERES KYM, UN ASISTENTE ELITE DE IA. REGLAS CRITICAS:\n"
+            "1. IDIOMA: Espanol profesional siempre.\n"
             "2. HERRAMIENTAS: Tienes acceso real a internet mediante comandos. "
-            "Si necesitas consultar información actual, escribe un comando como [SEARCH: tema]. "
-            "No inventes datos ni finjas haber buscado si no ejecutaste una herramienta.\n"
-            "3. EJECUCIÓN: Cuando recibas resultados de herramienta, usa esos datos para responder. "
-            "Si el usuario pidió resumen, resume. Si no lo pidió, responde normal sin forzar resumen.\n\n"
-            "4. AUTOCONTROL: Antes de responder, revisa si tu salida contiene enlaces inventados, "
-            "si usaste solo datos reales y si cumpliste exactamente lo pedido. Si no, corrige antes de enviar.\n"
-            "EJEMPLO DE USO:\n"
-            "Usuario: '¿Qué tiempo hace en Madrid?'\n"
+            "Si necesitas informacion actual, usa [SEARCH: tema]. "
+            "Si el usuario te pasa una URL o pregunta que pone en una web, usa [READ: https://...]. "
+            "No inventes datos ni finjas haber leido o buscado si no ejecutaste una herramienta.\n"
+            "3. EJECUCION: Cuando recibas resultados de herramienta, responde usando esos datos. "
+            "Si el usuario pidio resumen, resume. Si no lo pidio, responde normal.\n"
+            "4. AUTOCONTROL: Antes de responder, revisa si cumpliste toda la peticion, "
+            "si usaste solo datos reales y si no hay enlaces o contenido inventado.\n\n"
+            "EJEMPLOS:\n"
+            "Usuario: 'Que tiempo hace en Madrid?'\n"
             "Kym: [SEARCH: clima en Madrid hoy]\n"
             "Usuario: 'Dime las noticias de hoy'\n"
-            "Kym: [SEARCH: noticias destacadas hoy españa]\n\n"
-            "5. NO MIENTAS: Si no has ejecutado una herramienta, no afirmes haber consultado internet.\n"
-            "6. FORMATO: Markdown elegante.\n\n"
+            "Kym: [SEARCH: noticias destacadas hoy espana]\n"
+            "Usuario: 'Que pone en esta web? https://pubmed.ncbi.nlm.nih.gov/32824977/'\n"
+            "Kym: [READ: https://pubmed.ncbi.nlm.nih.gov/32824977/]\n\n"
+            "5. FORMATO: Markdown claro y util.\n\n"
             f"MEMORIA ESENCIAL:\n{essential}\n"
-            f"CATEGORÍAS: {categories}\n{active_str}\n"
+            f"CATEGORIAS: {categories}\n{active_str}\n"
             "--- CONTEXTO ADICIONAL ---\n"
             f"{ext}\n"
-            "RECUERDA: Usa comandos cuando haga falta, espera los resultados de la herramienta y luego responde con la mejor salida posible."
+            "RECUERDA: Si hace falta herramienta, emite solo el comando. Cuando el sistema te devuelva datos, responde con ellos."
         )
 
     def apply_saves(self, saves):

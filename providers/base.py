@@ -2,13 +2,18 @@ import asyncio
 import re
 import warnings
 from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
 from typing import Callable, Literal
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
 
-COMMAND_PATTERN = re.compile(r"\[.*?\]")
-SAVE_PATTERN = re.compile(r"\[SAVE:\s*(.*?)\s*\|\s*(.*?)\]")
-SEARCH_PATTERN = re.compile(r"\[SEARCH:\s*(.*?)\]")
+COMMAND_PATTERN = re.compile(r"\[(SEARCH|SAVE|LOAD|READ):.*?\]", re.IGNORECASE)
+SAVE_PATTERN = re.compile(r"\[SAVE:\s*(.*?)\s*\|\s*(.*?)\]", re.IGNORECASE)
+SEARCH_PATTERN = re.compile(r"\[SEARCH:\s*(.*?)\]", re.IGNORECASE)
+READ_PATTERN = re.compile(r"\[READ:\s*(https?://[^\]]+)\]", re.IGNORECASE)
 EXAMPLE_LINK_PATTERN = re.compile(r"example\.com", re.IGNORECASE)
 LIST_ITEM_PATTERN = re.compile(r"(?m)^\s*(?:\d+[\.)]|[-*])\s+")
 SUMMARY_HINT_PATTERN = re.compile(
@@ -19,6 +24,35 @@ SYNC_STREAM_END = object()
 
 SystemPromptBuilder = Callable[[str], str]
 StopRequested = Callable[[], bool]
+
+
+class SimpleHTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_script = False
+        self.in_style = False
+        self.text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        lower = tag.lower()
+        if lower == "script":
+            self.in_script = True
+        elif lower == "style":
+            self.in_style = True
+
+    def handle_endtag(self, tag):
+        lower = tag.lower()
+        if lower == "script":
+            self.in_script = False
+        elif lower == "style":
+            self.in_style = False
+
+    def handle_data(self, data):
+        if self.in_script or self.in_style:
+            return
+        text = " ".join(data.split())
+        if text:
+            self.text_parts.append(text)
 
 
 @dataclass(frozen=True)
@@ -42,6 +76,14 @@ class SearchResultItem:
     summary: str
 
 
+@dataclass(frozen=True)
+class PageReadResult:
+    url: str
+    title: str
+    summary: str
+    content: str
+
+
 def make_status_event(status: str, detail: str) -> StreamEvent:
     return StreamEvent(kind="status", value=status, detail=detail)
 
@@ -51,7 +93,7 @@ def make_text_event(text: str) -> StreamEvent:
 
 
 def strip_agent_commands(text: str) -> str:
-    return re.sub(r"\[(SEARCH|SAVE|LOAD):.*?\]", "", text, flags=re.IGNORECASE)
+    return COMMAND_PATTERN.sub("", text)
 
 
 def extract_saved_facts(text: str):
@@ -81,24 +123,18 @@ def normalize_search_query(query: str) -> str:
 def build_search_variants(query: str):
     base = normalize_search_query(query)
     variants = []
-    
-    # Variantes más efectivas para noticias
     for candidate in (
         base,
         f"{base} noticias" if base else "",
         f"{base} hoy" if base else "",
         f"ultimas noticias {base}" if base else "",
         f"{base} actualidad" if base else "",
-        base,  # repetir base al final
     ):
         candidate = normalize_search_query(candidate)
         if candidate and candidate not in variants and len(candidate) > 3:
             variants.append(candidate)
-    
-    # Si no hay variantes o son muy pocas, añadir términos generales
-    if not variants or len(variants) < 2:
+    if not variants:
         variants.append("noticias actualidad")
-    
     return variants
 
 
@@ -140,19 +176,7 @@ def clean_search_text(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    for prefix in (
-        "Consulta las ultimas noticias de actualidad al minuto y la ultima hora de Espana, Mexico, America y el mundo en ",
-        "Noticias de ultima hora en Espana y el mundo. Toda la actualidad y las ultimas noticias nacionales e internacionales aqui, en ",
-        "Listado de las ultimas noticias publicadas en ",
-    ):
-        cleaned = cleaned.replace(prefix, "")
-    cleaned = re.sub(
-        r"\s+[–-]\s+(EL PAIS|EL MUNDO|RTVE\.es?)\b.*$",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    return cleaned.strip(" -–:|")
+    return cleaned.strip(" -:|")
 
 
 def summarize_search_text(text: str, limit: int = 170) -> str:
@@ -161,54 +185,86 @@ def summarize_search_text(text: str, limit: int = 170) -> str:
     cleaned = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)[0].strip()
     if len(cleaned) <= limit:
         return cleaned
-    return cleaned[: limit - 1].rstrip() + "..."
+    return cleaned[: limit - 3].rstrip() + "..."
 
 
 def parse_search_results(results, limit: int = 3):
-    """Parsea los resultados de búsqueda correctamente"""
     items = []
-    
     for raw in (results or [])[:limit]:
-        # Si raw es string, parsear líneas
-        if isinstance(raw, str):
-            title = ""
-            link = ""
-            summary = ""
-            
-            for line in raw.split('\n'):
-                line = line.strip()
-                if line.startswith("FUENTE:"):
-                    title = line.replace("FUENTE:", "").strip()
-                elif line.startswith("LINK:"):
-                    link = line.replace("LINK:", "").strip()
-                elif line.startswith("RESUMEN:"):
-                    summary = line.replace("RESUMEN:", "").strip()
-            
-            # Si no se encontró título pero hay link, usar el dominio
-            if not title and link:
-                from urllib.parse import urlparse
-                domain = urlparse(link).netloc
-                title = domain.replace('www.', '')
-            
-            if summary or link:
-                items.append(SearchResultItem(
-                    title=title or "Noticia",
+        title = ""
+        link = ""
+        summary = ""
+        for line in str(raw).splitlines():
+            clean_line = line.strip()
+            upper_line = clean_line.upper()
+            if upper_line.startswith("FUENTE:"):
+                title = clean_line.split(":", 1)[1].strip()
+            elif upper_line.startswith("LINK:"):
+                link = clean_line.split(":", 1)[1].strip()
+            elif upper_line.startswith("RESUMEN:"):
+                summary = clean_line.split(":", 1)[1].strip()
+        if title or link or summary:
+            items.append(
+                SearchResultItem(
+                    title=clean_search_text(title) or "Sin titular",
                     link=link,
-                    summary=summary[:300]  # Limitar longitud
-                ))
-        else:
-            # Si ya es un objeto SearchResultItem
-            items.append(raw)
-    
+                    summary=summarize_search_text(summary, limit=220),
+                )
+            )
     return items
+
+
+def _extract_meta(html: str, attr_name: str, attr_value: str):
+    patterns = [
+        rf'<meta[^>]+{attr_name}=["\']{re.escape(attr_value)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+{attr_name}=["\']{re.escape(attr_value)}["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            return unescape(match.group(1)).strip()
+    return ""
+
+
+def _extract_title(html: str):
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return unescape(" ".join(match.group(1).split())).strip()
+
+
+def _extract_pubmed_abstract(html: str):
+    matches = re.findall(
+        r'<div[^>]+class=["\'][^"\']*abstract-content[^"\']*["\'][^>]*>(.*?)</div>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    parts = []
+    for chunk in matches:
+        text = re.sub(r"<[^>]+>", " ", chunk)
+        text = " ".join(unescape(text).split())
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+def _extract_generic_text(html: str):
+    parser = SimpleHTMLTextExtractor()
+    parser.feed(html)
+    text = " ".join(parser.text_parts)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _truncate(text: str, limit: int):
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 async def run_web_search(query: str):
     try:
-        warnings.filterwarnings(
-            "ignore",
-            message="This package .* has been renamed to .*",
-        )
+        warnings.filterwarnings("ignore", message="This package .* has been renamed to .*")
         from ddgs import DDGS
     except ImportError as exc:
         raise RuntimeError(
@@ -219,51 +275,75 @@ async def run_web_search(query: str):
         with DDGS() as ddgs:
             for candidate in build_search_variants(query):
                 try:
-                    # CORRECCIÓN: Usar 'query=' como argumento nombrado
                     results = list(ddgs.text(query=candidate, max_results=5))
-                    
-                    if not results:
-                        continue
-                    
-                    formatted = []
-                    for result in results:
-                        title = result.get("title", "").strip()
-                        link = result.get("href", "").strip()
-                        body = result.get("body", "").strip()
-                        
-                        if body or link:
-                            formatted.append(
-                                f"FUENTE: {title}\nLINK: {link}\nRESUMEN: {body}\n---"
-                            )
-                    
-                    if formatted:
-                        return formatted
-                        
-                except TypeError as te:
-                    # Si falla con argumento nombrado, intentar posicional
-                    try:
-                        results = list(ddgs.text(candidate, max_results=5))
-                        formatted = []
-                        for result in results:
-                            title = result.get("title", "").strip()
-                            link = result.get("href", "").strip()
-                            body = result.get("body", "").strip()
-                            if body or link:
-                                formatted.append(
-                                    f"FUENTE: {title}\nLINK: {link}\nRESUMEN: {body}\n---"
-                                )
-                        if formatted:
-                            return formatted
-                    except Exception as e2:
-                        print(f"Error con argumento posicional: {e2}")
-                        
-                except Exception as e:
-                    print(f"Error en búsqueda con '{candidate}': {e}")
+                except TypeError:
+                    results = list(ddgs.text(candidate, max_results=5))
+                except Exception:
                     continue
-            
+
+                formatted = []
+                for result in results:
+                    title = (result.get("title") or "").strip()
+                    link = (result.get("href") or "").strip()
+                    body = (result.get("body") or "").strip()
+                    if not (title or link or body):
+                        continue
+                    formatted.append(
+                        f"FUENTE: {title}\nLINK: {link}\nRESUMEN: {body}\n---"
+                    )
+                if formatted:
+                    return formatted
             return []
 
     return await asyncio.to_thread(_search)
+
+
+async def run_url_read(url: str):
+    def _read():
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; KymBot/1.0; +https://localhost)",
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            charset_match = re.search(r"charset=([^\s;]+)", content_type, flags=re.IGNORECASE)
+            charset = charset_match.group(1) if charset_match else "utf-8"
+            raw = response.read()
+        html = raw.decode(charset, errors="replace")
+
+        title = (
+            _extract_meta(html, "name", "citation_title")
+            or _extract_meta(html, "property", "og:title")
+            or _extract_title(html)
+        )
+        summary = (
+            _extract_meta(html, "name", "description")
+            or _extract_meta(html, "property", "og:description")
+            or ""
+        )
+
+        parsed = urlparse(url)
+        if "pubmed.ncbi.nlm.nih.gov" in parsed.netloc.lower():
+            content = _extract_pubmed_abstract(html)
+            if not summary:
+                summary = content
+        else:
+            content = _extract_generic_text(html)
+
+        content = _truncate(content, 4000)
+        summary = _truncate(" ".join((summary or "").split()), 800)
+
+        return PageReadResult(
+            url=url,
+            title=title or parsed.netloc or url,
+            summary=summary,
+            content=content,
+        )
+
+    return await asyncio.to_thread(_read)
 
 
 def render_search_response(results, query: str = "", compact: bool = False, limit: int = 3) -> str:
@@ -273,29 +353,32 @@ def render_search_response(results, query: str = "", compact: bool = False, limi
             return f"No encontre resultados utiles para: {query}."
         return "No encontre resultados utiles."
 
-    if compact:
-        header = "📰 **RESUMEN DE NOTICIAS**\n"
-        lines = [header]
-        for index, item in enumerate(items, start=1):
-            title = item.title or "Sin titular"
-            summary = summarize_search_text(item.summary, limit=150)
-            if not summary:
-                summary = "Sin resumen disponible."
-            lines.append(f"\n**{index}. {title}**")
-            lines.append(f"📝 {summary}")
-            if item.link:
-                lines.append(f"🔗 {item.link}")
-        return "\n".join(lines)
-    else:
-        header = f"🔍 Resultados para: {query}\n" if query else "🔍 Resultados encontrados:\n"
-        lines = [header]
-        for index, item in enumerate(items, start=1):
-            lines.append(f"\n{index}. **{item.title}**")
-            if item.summary:
-                lines.append(f"   {item.summary}")
-            if item.link:
-                lines.append(f"   📎 {item.link}")
-        return "\n".join(lines)
+    header = "Aqui tienes 3 noticias resumidas" if compact else "Aqui tienes resultados reales"
+    if query:
+        header += f" para {query}"
+    header += ":"
+
+    lines = [header]
+    for index, item in enumerate(items, start=1):
+        lines.append(f"{index}. **{item.title}**")
+        lines.append(f"Resumen: {item.summary or 'Sin resumen disponible.'}")
+        if item.link and not compact:
+            lines.append(f"Fuente: {item.link}")
+    return "\n".join(lines)
+
+
+def render_read_response(page: PageReadResult, question: str = "") -> str:
+    lines = [f"Contenido leido de: {page.url}"]
+    if page.title:
+        lines.append(f"Titulo: {page.title}")
+    if page.summary:
+        lines.append(f"Resumen de la pagina: {page.summary}")
+    if page.content:
+        lines.append("Texto extraido:")
+        lines.append(page.content)
+    if question:
+        lines.append(f"Consulta original: {question}")
+    return "\n".join(lines)
 
 
 def format_search_results(results, query: str = "", limit: int = 3, compact: bool = False) -> str:

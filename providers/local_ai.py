@@ -1,17 +1,23 @@
+import asyncio
 import os
 import socket
 import subprocess
 import time
-import asyncio
-import re
 from urllib.parse import urlparse
 
 from .base import (
-    ProviderModel,
+    READ_PATTERN,
     SEARCH_PATTERN,
+    ProviderModel,
+    format_search_results,
     make_status_event,
     make_text_event,
+    normalize_search_query,
+    render_read_response,
+    render_search_response,
+    run_url_read,
     run_web_search,
+    wants_summary,
 )
 
 
@@ -28,23 +34,19 @@ class LocalAIProvider:
     def normalize_host(self, host: str | None):
         if host is None:
             return None
-
         clean_host = host.strip().rstrip("/")
         if not clean_host:
             return ""
-
         if "://" not in clean_host:
             if clean_host.startswith(("localhost", "127.0.0.1", "0.0.0.0")) or clean_host[:1].isdigit():
                 clean_host = f"http://{clean_host}"
             else:
                 clean_host = f"https://{clean_host}"
-
         return clean_host
 
     def configure(self, *, enabled: bool | None = None, host: str | None = None):
         if enabled is not None:
             self.enabled = enabled
-
         if host is not None:
             clean_host = self.normalize_host(host)
             if clean_host and clean_host != self.host:
@@ -74,22 +76,18 @@ class LocalAIProvider:
     def get_client(self):
         if not self.enabled:
             return None
-
         if self._client is not None:
             return self._client
-
         if self._import_error is not None:
             return None
-
         try:
             import ollama
         except ImportError as exc:
             self._import_error = exc
             self.logger.warning(
-                "La IA local no está disponible porque falta la librería 'ollama'."
+                "La IA local no esta disponible porque falta la libreria 'ollama'."
             )
             return None
-
         self._client = ollama.AsyncClient(
             host=self.host,
             headers=self.build_client_headers(),
@@ -100,7 +98,6 @@ class LocalAIProvider:
         client = self.get_client()
         if not client:
             return []
-
         try:
             response = await client.list()
         except Exception as exc:
@@ -120,46 +117,10 @@ class LocalAIProvider:
                 name = item.get("name") or item.get("model")
             else:
                 name = getattr(item, "name", None) or getattr(item, "model", None)
-
             if name:
-                label = name
-                if self.is_remote_host():
-                    label = f"{name} (Colab)"
+                label = f"{name} (Colab)" if self.is_remote_host() else name
                 models.append(ProviderModel(id=name, label=label, source=self.source))
         return models
-
-    def _clean_query(self, text: str):
-        """Limpia la query manteniendo las palabras clave importantes"""
-        import re
-        
-        # Convertir a minúsculas
-        text = text.lower()
-        
-        # Eliminar frases comunes al inicio
-        text = re.sub(r'^(dame|dime|busca|quiero|necesito|por favor)\s+', '', text)
-        
-        # Eliminar palabras al final
-        text = re.sub(r'\s+(por favor|gracias)$', '', text)
-        
-        # Eliminar artículos y preposiciones (pero mantener palabras clave)
-        text = re.sub(r'\b(de|la|las|los|y|el|lo|un|una|unos|unas|del|al)\b', ' ', text)
-        
-        # Limpiar espacios múltiples
-        text = ' '.join(text.split())
-        
-        # Si la query es solo un número o muy corta, añadir contexto
-        if re.match(r'^\d+$', text):
-            text = f"noticias {text}"
-        
-        # Si la query es "dia" o "día", añadir "noticias"
-        if text in ["dia", "día", "hoy"]:
-            text = f"noticias {text}"
-        
-        # Si la query sigue siendo muy corta, usar default
-        if len(text) < 5:
-            return "noticias actualidad"
-        
-        return text
 
     async def stream_chat(
         self,
@@ -177,85 +138,56 @@ class LocalAIProvider:
             {"role": "system", "content": build_system_prompt(extra_context)}
         ] + history_messages
 
-        self.logger.info("=== PRIMERA LLAMADA AL MODELO ===")
+        compact = wants_summary(history_messages[-1]["content"])
         response = await client.chat(model=model, messages=full_messages)
-        thought = response["message"]["content"]
-        self.logger.info(f"Pensamiento recibido (longitud: {len(thought)} chars)")
+        thought = response["message"]["content"] or ""
+
+        read = READ_PATTERN.search(thought)
+        if read:
+            url = read.group(1).strip()
+            yield make_status_event("network", f"Leyendo contenido real de: '{url}'...")
+            page = await run_url_read(url)
+            answer = render_read_response(page, question=history_messages[-1]["content"])
+            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
+            words = answer.split(" ")
+            for i, word in enumerate(words):
+                if stop_requested():
+                    break
+                yield make_text_event(word + (" " if i < len(words) - 1 else ""))
+                await asyncio.sleep(0.005)
+            return
 
         search = SEARCH_PATTERN.search(thought)
-        intent_keywords = ["enlace", "link", "fuente", "noticia", "buscar", "search", "noticias"]
-        has_intent = any(kw in thought.lower() for kw in intent_keywords)
-        
-        self.logger.info(f"¿Búsqueda detectada? search={search is not None}, has_intent={has_intent}")
-        
-        if search or has_intent:
-            raw_query = search.group(1) if search else history_messages[-1]["content"]
-            query = self._clean_query(raw_query)
-            self.logger.info(f"Query limpia: '{query}'")
-            
-            yield make_status_event("network", f"Buscando en tiempo real: '{query}'...")
-            
-            try:
-                search_results = await run_web_search(query)
-                self.logger.info(f"Resultados obtenidos: {len(search_results)}")
-                
-                if search_results:
-                    formatted_results = "\n".join(search_results[:5])  # Limitar a 5 resultados
-                    self.logger.info(f"Resultados formateados (primeros 200 chars): {formatted_results[:200]}...")
-                    
-                    full_messages.append({"role": "assistant", "content": thought})
-                    full_messages.append({
-                        "role": "user", 
-                        "content": (
-                            f"RESULTADOS DE INTERNET (con links reales):\n{formatted_results}\n\n"
-                            "INSTRUCCIONES IMPORTANTES:\n"
-                            "1. Los links (🔗 o 📎) son URLs reales y funcionales\n"
-                            "2. DEBES incluir los links originales en tu respuesta\n"
-                            "3. Si el usuario pide links, proporciona los que están en los resultados\n"
-                            "4. No digas que no hay links si aparecen en los resultados\n"
-                            "5. Responde en español de forma clara y concisa"
-                        )
-                    })
-                    
-                    self.logger.info("=== SEGUNDA LLAMADA AL MODELO (STREAM) ===")
-                    yield make_status_event("writing", "Procesando información y redactando...")
-                    
-                    stream = await client.chat(model=model, messages=full_messages, stream=True)
-                    
-                    chunk_count = 0
-                    async for chunk in stream:
-                        if stop_requested():
-                            self.logger.info("Stop requested, interrumpiendo stream")
-                            break
-                        
-                        chunk_count += 1
-                        text = chunk["message"]["content"]
-                        
-                        if text:
-                            self.logger.debug(f"Chunk {chunk_count}: '{text[:50]}'")
-                            yield make_text_event(text)
-                    
-                    self.logger.info(f"Stream finalizado. Total chunks: {chunk_count}")
-                    
-                    if chunk_count == 0:
-                        self.logger.error("¡No se recibieron chunks del stream!")
-                        yield make_text_event("Lo siento, no pude generar una respuesta con los resultados de búsqueda.")
-                    
-                    return 
-                else:
-                    self.logger.warning("No se obtuvieron resultados de búsqueda")
-                    yield make_text_event("No encontré resultados relevantes para tu búsqueda. ¿Podrías reformular la pregunta?")
-                    
-            except Exception as e:
-                self.logger.error(f"Error en búsqueda: {e}", exc_info=True)
-                yield make_text_event(f"Error al buscar: {str(e)}")
-        else:
-            self.logger.info("No se detectó intención de búsqueda, usando respuesta directa")
-            yield make_status_event("writing", "Respondiendo...")
-            yield make_text_event(thought)
+        if search:
+            query = normalize_search_query(search.group(1))
+            if not query:
+                query = normalize_search_query(history_messages[-1]["content"])
+            if not query:
+                query = "noticias del dia"
+            yield make_status_event("network", f"Buscando fuentes reales para: '{query}'...")
+            search_results = await run_web_search(query)
+            answer = render_search_response(search_results, query=query, compact=compact)
+            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
+            words = answer.split(" ")
+            for i, word in enumerate(words):
+                if stop_requested():
+                    break
+                yield make_text_event(word + (" " if i < len(words) - 1 else ""))
+                await asyncio.sleep(0.005)
+            return
+
+        yield make_status_event("writing", "Respondiendo...")
+        final_text = thought.strip()
+        if not final_text:
+            final_text = format_search_results([], query=history_messages[-1]["content"], compact=compact)
+        words = final_text.split(" ")
+        for i, word in enumerate(words):
+            if stop_requested():
+                break
+            yield make_text_event(word + (" " if i < len(words) - 1 else ""))
+            await asyncio.sleep(0.005)
 
     def ensure_running(self):
-        """Comprueba si Ollama está activo y, si no, intenta iniciarlo."""
         if self.is_remote_host():
             print(f"Ollama remoto configurado en {self.host}. No se inicia nada en local.")
             return True
@@ -263,10 +195,10 @@ class LocalAIProvider:
         port = 11434
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             if sock.connect_ex(("127.0.0.1", port)) == 0:
-                print("Ollama ya está en ejecución.")
+                print("Ollama ya esta en ejecucion.")
                 return True
 
-        print("Ollama no detectado. Intentando iniciar servicio automáticamente...")
+        print("Ollama no detectado. Intentando iniciar servicio automaticamente...")
         try:
             subprocess.Popen(
                 ["ollama", "serve"],
@@ -274,15 +206,13 @@ class LocalAIProvider:
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-
             for _ in range(10):
                 time.sleep(1)
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     if sock.connect_ex(("127.0.0.1", port)) == 0:
-                        print("Servicio Ollama iniciado con éxito.")
+                        print("Servicio Ollama iniciado con exito.")
                         return True
-
-            print("No se pudo iniciar Ollama automáticamente. Ábrelo manualmente.")
+            print("No se pudo iniciar Ollama automaticamente. Abrelo manualmente.")
         except Exception as exc:
             print(f"Error al intentar ejecutar Ollama: {exc}")
         return False

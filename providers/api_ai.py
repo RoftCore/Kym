@@ -2,6 +2,7 @@ import os
 from uuid import uuid4
 
 from .base import (
+    READ_PATTERN,
     SEARCH_PATTERN,
     ProviderModel,
     build_api_messages,
@@ -9,7 +10,9 @@ from .base import (
     make_status_event,
     make_text_event,
     normalize_search_query,
+    render_read_response,
     render_search_response,
+    run_url_read,
     run_web_search,
     wants_summary,
 )
@@ -120,50 +123,48 @@ class OpenAICompatibleProvider:
         except Exception:
             thought = ""
 
-        search = SEARCH_PATTERN.search(thought)
-        if not search:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=api_messages,
-                stream=True,
-            )
-
-            yield make_status_event("writing", "Redactando respuesta...")
-            async for chunk in iter_sync_stream(stream):
+        read = READ_PATTERN.search(thought)
+        if read:
+            url = read.group(1).strip()
+            yield make_status_event("network", f"Leyendo contenido real de: '{url}'...")
+            page = await run_url_read(url)
+            answer = render_read_response(page, question=history_messages[-1]["content"])
+            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
+            for word in answer.split(" "):
                 if stop_requested():
                     break
-                text = chunk.choices[0].delta.content or ""
-                if text:
-                    yield make_text_event(text)
+                yield make_text_event(word + " ")
             return
 
-        query = normalize_search_query(search.group(1))
-        if not query:
-            query = normalize_search_query(history_messages[-1]["content"])
-        if not query:
-            query = "noticias del dia"
-
-        yield make_status_event("network", f"Buscando en internet: '{query}'...")
-
-        try:
+        search = SEARCH_PATTERN.search(thought)
+        if search:
+            query = normalize_search_query(search.group(1))
+            if not query:
+                query = normalize_search_query(history_messages[-1]["content"])
+            if not query:
+                query = "noticias del dia"
+            yield make_status_event("network", f"Buscando en internet: '{query}'...")
             search_results = await run_web_search(query)
-        except Exception as exc:
-            search_results = []
-            self._client = None
-            raise RuntimeError(f"Error durante la busqueda web: {exc}") from exc
+            answer = render_search_response(search_results, query=query, compact=compact)
+            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
+            for word in answer.split(" "):
+                if stop_requested():
+                    break
+                yield make_text_event(word + " ")
+            return
 
-        answer = render_search_response(
-            search_results,
-            query=query,
-            compact=compact,
+        stream = client.chat.completions.create(
+            model=model,
+            messages=api_messages,
+            stream=True,
         )
-
-        yield make_status_event("writing", "Redactando respuesta con datos actuales...")
-        words = answer.split(" ")
-        for i, word in enumerate(words):
+        yield make_status_event("writing", "Redactando respuesta...")
+        async for chunk in iter_sync_stream(stream):
             if stop_requested():
                 break
-            yield make_text_event(word + (" " if i < len(words) - 1 else ""))
+            text = chunk.choices[0].delta.content or ""
+            if text:
+                yield make_text_event(text)
 
     def to_config(self):
         return {
