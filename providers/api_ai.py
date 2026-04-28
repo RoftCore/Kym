@@ -2,11 +2,16 @@ import os
 from uuid import uuid4
 
 from .base import (
+    SEARCH_PATTERN,
     ProviderModel,
     build_api_messages,
     iter_sync_stream,
     make_status_event,
     make_text_event,
+    normalize_search_query,
+    render_search_response,
+    run_web_search,
+    wants_summary,
 )
 
 
@@ -79,7 +84,7 @@ class OpenAICompatibleProvider:
             from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError(
-                "El modelo API requiere la librería 'openai'. Instálala o elige un modelo local."
+                "El modelo API requiere la libreria 'openai'. Instalala o elige un modelo local."
             ) from exc
 
         self._client = OpenAI(base_url=self.base_url, api_key=api_key)
@@ -103,20 +108,62 @@ class OpenAICompatibleProvider:
             {"role": "system", "content": build_system_prompt(extra_context)}
         ] + history_messages
         api_messages = build_api_messages(full_messages)
+        compact = wants_summary(history_messages[-1]["content"])
 
-        stream = client.chat.completions.create(
-            model=model,
-            messages=api_messages,
-            stream=True,
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=api_messages,
+                max_tokens=120,
+            )
+            thought = response.choices[0].message.content or ""
+        except Exception:
+            thought = ""
+
+        search = SEARCH_PATTERN.search(thought)
+        if not search:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=api_messages,
+                stream=True,
+            )
+
+            yield make_status_event("writing", "Redactando respuesta...")
+            async for chunk in iter_sync_stream(stream):
+                if stop_requested():
+                    break
+                text = chunk.choices[0].delta.content or ""
+                if text:
+                    yield make_text_event(text)
+            return
+
+        query = normalize_search_query(search.group(1))
+        if not query:
+            query = normalize_search_query(history_messages[-1]["content"])
+        if not query:
+            query = "noticias del dia"
+
+        yield make_status_event("network", f"Buscando en internet: '{query}'...")
+
+        try:
+            search_results = await run_web_search(query)
+        except Exception as exc:
+            search_results = []
+            self._client = None
+            raise RuntimeError(f"Error durante la busqueda web: {exc}") from exc
+
+        answer = render_search_response(
+            search_results,
+            query=query,
+            compact=compact,
         )
 
-        yield make_status_event("writing", "Redactando respuesta...")
-        async for chunk in iter_sync_stream(stream):
+        yield make_status_event("writing", "Redactando respuesta con datos actuales...")
+        words = answer.split(" ")
+        for i, word in enumerate(words):
             if stop_requested():
                 break
-            text = chunk.choices[0].delta.content or ""
-            if text:
-                yield make_text_event(text)
+            yield make_text_event(word + (" " if i < len(words) - 1 else ""))
 
     def to_config(self):
         return {

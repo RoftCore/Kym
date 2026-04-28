@@ -255,6 +255,9 @@ async def chat(
 
             build_system_prompt = lambda extra: agent.build_prompt(session_data, extra)
 
+            # Buffer para ocultar comandos [SEARCH...] durante el streaming
+            stream_buffer = ""
+            
             async for event in provider.stream_chat(
                 model=model,
                 history_messages=session_data["history"],
@@ -267,13 +270,35 @@ async def chat(
                     continue
 
                 full_answer += event.value
-                yield strip_agent_commands(event.value)
+                stream_buffer += event.value
+                
+                # Si hay un corchete abierto, esperamos a ver si es un comando
+                if "[" in stream_buffer:
+                    if "]" in stream_buffer:
+                        # Tenemos un bloque completo, lo limpiamos y soltamos el resto
+                        clean = strip_agent_commands(stream_buffer)
+                        if clean:
+                            yield clean
+                        stream_buffer = ""
+                    elif len(stream_buffer) > 100: 
+                        # Si el buffer crece mucho sin cerrar corchete, probablemente no sea un comando
+                        yield stream_buffer
+                        stream_buffer = ""
+                else:
+                    # No hay comandos a la vista, soltamos el texto
+                    yield stream_buffer
+                    stream_buffer = ""
 
-            clean = strip_agent_commands(full_answer).strip()
+            # Soltar cualquier residuo del buffer
+            if stream_buffer:
+                yield strip_agent_commands(stream_buffer)
+
+            # Limpieza final profunda para el historial
+            final_clean = strip_agent_commands(full_answer).strip()
             if agent.apply_saves(extract_saved_facts(full_answer)):
                 yield "status:saving:Memorizando...\n"
 
-            session_data["history"].append({"role": "assistant", "content": clean})
+            session_data["history"].append({"role": "assistant", "content": final_clean})
             agent.save_session_data(session_id, session_data)
             logger.info("Respuesta completada")
 
