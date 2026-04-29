@@ -233,8 +233,14 @@ async def chat(
     agent.stop_requested = False
     session_data = agent.get_session_data(session_id)
     file_ctx, images = await extract_file_context(file)
+    
+    if file_ctx:
+        logger.info("Contexto de archivo extraído: %d caracteres", len(file_ctx))
+        full_message = f"{file_ctx}\n\n{message}"
+    else:
+        full_message = message
 
-    user_msg = {"role": "user", "content": message}
+    user_msg = {"role": "user", "content": full_message}
     if images:
         user_msg["images"] = images
     session_data["history"].append(user_msg)

@@ -113,31 +113,27 @@ class OpenAICompatibleProvider:
         api_messages = build_api_messages(full_messages)
         compact = wants_summary(history_messages[-1]["content"])
 
+        # Primera llamada para ver si quiere usar herramientas
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=api_messages,
-                max_tokens=120,
+                max_tokens=150, # Suficiente para un comando
             )
             thought = response.choices[0].message.content or ""
         except Exception:
             thought = ""
 
         read = READ_PATTERN.search(thought)
+        search = SEARCH_PATTERN.search(thought)
+        
+        tool_result = None
         if read:
             url = read.group(1).strip()
             yield make_status_event("network", f"Leyendo contenido real de: '{url}'...")
             page = await run_url_read(url)
-            answer = render_read_response(page, question=history_messages[-1]["content"])
-            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
-            for word in answer.split(" "):
-                if stop_requested():
-                    break
-                yield make_text_event(word + " ")
-            return
-
-        search = SEARCH_PATTERN.search(thought)
-        if search:
+            tool_result = render_read_response(page, question=history_messages[-1]["content"])
+        elif search:
             query = normalize_search_query(search.group(1))
             if not query:
                 query = normalize_search_query(history_messages[-1]["content"])
@@ -145,20 +141,22 @@ class OpenAICompatibleProvider:
                 query = "noticias del dia"
             yield make_status_event("network", f"Buscando en internet: '{query}'...")
             search_results = await run_web_search(query)
-            answer = render_search_response(search_results, query=query, compact=compact)
-            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
-            for word in answer.split(" "):
-                if stop_requested():
-                    break
-                yield make_text_event(word + " ")
-            return
+            tool_result = render_search_response(search_results, query=query, compact=compact)
 
+        if tool_result:
+            # Añadir el pensamiento y el resultado al flujo
+            api_messages.append({"role": "assistant", "content": thought})
+            api_messages.append({"role": "user", "content": f"[SISTEMA: Datos obtenidos]\n{tool_result}\n\nResponde ahora al usuario basándote en estos datos."})
+            yield make_status_event("writing", "Procesando información...")
+        else:
+            yield make_status_event("writing", "Redactando respuesta...")
+
+        # Llamada final con streaming
         stream = client.chat.completions.create(
             model=model,
             messages=api_messages,
             stream=True,
         )
-        yield make_status_event("writing", "Redactando respuesta...")
         async for chunk in iter_sync_stream(stream):
             if stop_requested():
                 break

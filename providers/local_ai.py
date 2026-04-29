@@ -134,58 +134,50 @@ class LocalAIProvider:
         if not client:
             raise RuntimeError("Ollama no disponible.")
 
-        full_messages = [
-            {"role": "system", "content": build_system_prompt(extra_context)}
-        ] + history_messages
+        system_msg = {"role": "system", "content": build_system_prompt(extra_context)}
+        messages = [system_msg] + history_messages
 
-        compact = wants_summary(history_messages[-1]["content"])
-        response = await client.chat(model=model, messages=full_messages)
+        # Primera llamada para ver si quiere usar herramientas
+        response = await client.chat(model=model, messages=messages)
         thought = response["message"]["content"] or ""
 
+        # Verificar si hay comandos
         read = READ_PATTERN.search(thought)
+        search = SEARCH_PATTERN.search(thought)
+        
+        tool_result = None
         if read:
             url = read.group(1).strip()
             yield make_status_event("network", f"Leyendo contenido real de: '{url}'...")
             page = await run_url_read(url)
-            answer = render_read_response(page, question=history_messages[-1]["content"])
-            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
-            words = answer.split(" ")
-            for i, word in enumerate(words):
-                if stop_requested():
-                    break
-                yield make_text_event(word + (" " if i < len(words) - 1 else ""))
-                await asyncio.sleep(0.005)
-            return
-
-        search = SEARCH_PATTERN.search(thought)
-        if search:
+            tool_result = render_read_response(page, question=history_messages[-1]["content"])
+        elif search:
             query = normalize_search_query(search.group(1))
             if not query:
                 query = normalize_search_query(history_messages[-1]["content"])
             if not query:
                 query = "noticias del dia"
-            yield make_status_event("network", f"Buscando fuentes reales para: '{query}'...")
+            yield make_status_event("network", f"Buscando en internet: '{query}'...")
             search_results = await run_web_search(query)
-            answer = render_search_response(search_results, query=query, compact=compact)
-            yield make_status_event("writing", "Redactando respuesta con datos actuales...")
-            words = answer.split(" ")
-            for i, word in enumerate(words):
-                if stop_requested():
-                    break
-                yield make_text_event(word + (" " if i < len(words) - 1 else ""))
-                await asyncio.sleep(0.005)
-            return
+            compact = wants_summary(history_messages[-1]["content"])
+            tool_result = render_search_response(search_results, query=query, compact=compact)
 
-        yield make_status_event("writing", "Respondiendo...")
-        final_text = thought.strip()
-        if not final_text:
-            final_text = format_search_results([], query=history_messages[-1]["content"], compact=compact)
-        words = final_text.split(" ")
-        for i, word in enumerate(words):
+        if tool_result:
+            # Añadir el pensamiento y el resultado al flujo para que el LLM finalice
+            messages.append({"role": "assistant", "content": thought})
+            messages.append({"role": "user", "content": f"[SISTEMA: Datos obtenidos]\n{tool_result}\n\nResponde ahora al usuario basándote en estos datos."})
+            yield make_status_event("writing", "Procesando información...")
+        else:
+            yield make_status_event("writing", "Respondiendo...")
+
+        # Segunda llamada (o primera si no hubo herramienta) con streaming real
+        stream = await client.chat(model=model, messages=messages, stream=True)
+        async for chunk in stream:
             if stop_requested():
                 break
-            yield make_text_event(word + (" " if i < len(words) - 1 else ""))
-            await asyncio.sleep(0.005)
+            token = chunk["message"]["content"]
+            if token:
+                yield make_text_event(token)
 
     def ensure_running(self):
         if self.is_remote_host():

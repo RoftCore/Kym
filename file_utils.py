@@ -14,7 +14,7 @@ def extract_pdf_text(raw: bytes, filename: str) -> str:
 
     pdf = PdfReader(BytesIO(raw))
     text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-    return f"--- PDF {filename} ---\n{text[:4000]}"
+    return f"--- CONTENIDO DEL PDF {filename} ---\n{text[:16000]}\n--- FIN DEL PDF ---"
 
 
 async def extract_file_context(file: UploadFile | None):
@@ -32,5 +32,5 @@ async def extract_file_context(file: UploadFile | None):
     if file_name.lower().endswith(".pdf"):
         return extract_pdf_text(raw, file_name), []
 
-    text = raw.decode("utf-8", errors="ignore")[:4000]
-    return f"--- ARCHIVO {file_name} ---\n{text}", []
+    text = raw.decode("utf-8", errors="ignore")[:16000]
+    return f"--- CONTENIDO DEL ARCHIVO {file_name} ---\n{text}\n--- FIN DEL ARCHIVO ---", []
