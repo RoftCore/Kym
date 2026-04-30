@@ -87,6 +87,7 @@ def print_next_steps(public_url: str, model_name: str):
     print(f"Model loaded: {model_name}")
     print("")
     print("Start your local app with one of these options:")
+    print("  Usa la URL base del túnel, no /api/generate ni /api/chat.")
     print(f"  PowerShell (current session): $env:KYM_OLLAMA_HOST=\"{public_url}\"")
     print(f"  PowerShell (persistent): setx KYM_OLLAMA_HOST \"{public_url}\"")
     print("  Then run locally: python agent.py")

@@ -264,11 +264,10 @@ def _truncate(text: str, limit: int):
 
 async def run_web_search(query: str):
     try:
-        warnings.filterwarnings("ignore", message="This package .* has been renamed to .*")
-        from ddgs import DDGS
+        from duckduckgo_search import DDGS
     except ImportError as exc:
         raise RuntimeError(
-            "La busqueda web requiere la libreria 'ddgs' (pip install ddgs)"
+            "La búsqueda web requiere la librería 'duckduckgo-search' (pip install duckduckgo-search)"
         ) from exc
 
     def _search():
