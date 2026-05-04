@@ -1,5 +1,0 @@
-# Base dependencies required by the web app itself.
-fastapi
-uvicorn
-python-multipart
-pypdf

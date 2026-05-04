@@ -1,3 +1,0 @@
-# API-based AI stack. Includes the base app dependencies.
--r requirements.txt
-openai
